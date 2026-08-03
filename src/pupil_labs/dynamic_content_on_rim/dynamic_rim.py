@@ -107,7 +107,7 @@ def main():
         extra={"markup": True},
     )
     _, et_frames, et_pts, et_ts = read_video_ts(args.et_video_path)
-    if audio in audioSources:
+    if audio in audioSources and audio is not audioSources.No_Audio:
         arguments = {"audio": True}
         if audio == audioSources.Device_Mic:
             logging.info(
@@ -181,9 +181,12 @@ def main():
     _screen, _ = cv2.findContours(timg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     # Timestamp matching
     logging.info("Timestamp matching...")
-    start_video_ns = events_df.loc[events_df["name"] == "start.video"][
-        "timestamp [ns]"
-    ].values[0]
+    recording_begin = events_df.loc[
+        events_df["name"] == "recording.begin", "timestamp [ns]"
+    ]
+    if recording_begin.empty:
+        raise ValueError("events.csv does not contain a recording.begin event")
+    start_video_ns = recording_begin.values[0]
     # Create some timestamps [ns] for the screen video to match, use the start_video_ns
     # and the ts of the screen video
     sc_timestamps_ns = sc_ts + start_video_ns
@@ -191,9 +194,16 @@ def main():
         audio_ts = audio_ts + start_video_ns
     elif audio == audioSources.Device_Mic:
         audio_ts = audio_ts + np.min(world_timestamps_df["timestamp [ns]"])
-    end_video_ns = np.min(
-        [np.max(sc_timestamps_ns), np.max(world_timestamps_df["timestamp [ns]"])]
-    )
+    end_candidates = [
+        np.max(sc_timestamps_ns),
+        np.max(world_timestamps_df["timestamp [ns]"]),
+    ]
+    recording_end = events_df.loc[
+        events_df["name"] == "recording.end", "timestamp [ns]"
+    ]
+    if not recording_end.empty:
+        end_candidates.append(recording_end.values[0])
+    end_video_ns = np.min(end_candidates)
     # Match the timestamps gaze_rim_df, world_timestamps_df, gaze_df, fake_timestamps_ns
     sc_video_df = pd.DataFrame()
     sc_video_df["frame"] = np.arange(sc_frames)
@@ -425,7 +435,8 @@ def save_videos(  # noqa: C901 Ignore `Function too complex` flake8 error. TODO:
             elif audio == audioSources.Screen_Audio:
                 audio_arguments["rate"] = sc_audio.streams.audio[0].rate
             out_audio = out_container.add_stream(**audio_arguments)
-        out_audio.time_base = out_audio.codec_context.time_base
+            if out_audio.codec_context.time_base is not None:
+                out_audio.time_base = out_audio.codec_context.time_base
         idx = 0
         _etlpts = -1
         _sclpts = -1
@@ -617,8 +628,9 @@ def prepare_image(frame, xy, str, corners_screen, _screen, mheight=0, alpha=0.3)
     frame = np.asarray(frame, dtype=np.float32)
     frame = frame[:, :, :]
     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    xy_values = xy.to_numpy() if hasattr(xy, "to_numpy") else np.asarray(xy)
     # Check for NaNs
-    if np.isnan(xy[0]) or np.isnan(xy[1]):
+    if np.isnan(xy_values[0]) or np.isnan(xy_values[1]):
         if str == "Reference Image":
             frame = cv2.resize(
                 frame, (int(frame.shape[1] * mheight / frame.shape[0]), int(mheight))
@@ -627,7 +639,7 @@ def prepare_image(frame, xy, str, corners_screen, _screen, mheight=0, alpha=0.3)
                 "Resized reference image, gaze not plotted as xy contained a NaN value"
             )
         return frame
-    xy = xy.to_numpy(dtype=np.int32)
+    xy = xy_values.astype(np.int32)
     # Add screen overlay and downsize ref image
     if str == "Reference Image":
         if cv2.pointPolygonTest(_screen[0], (int(xy[0]), int(xy[1])), False) == 1:

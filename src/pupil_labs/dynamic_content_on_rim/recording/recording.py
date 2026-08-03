@@ -92,7 +92,7 @@ async def main():
             logging.info("Screen recording started")
             logging.info(
                 await device.send_event(
-                    "start.video",
+                    "recording.begin",
                     event_timestamp_unix_ns=np.mean([aftereq, befreq]) - offset,
                 )
             )
