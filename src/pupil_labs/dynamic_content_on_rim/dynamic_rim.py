@@ -181,12 +181,54 @@ def main():
     _screen, _ = cv2.findContours(timg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     # Timestamp matching
     logging.info("Timestamp matching...")
+    # Alignment anchor for the screen recording. Prefer 'start.video', which
+    # recording.py writes at the exact moment screen capture began (corrected
+    # for the Neon's clock offset) -- that is true measured synchronisation.
+    # Fall back to 'recording.begin', the Neon's own automatic event, which
+    # aligns correctly ONLY if both recordings started at the same instant.
+    _start_video = events_df.loc[events_df["name"] == "start.video", "timestamp [ns]"]
     recording_begin = events_df.loc[
         events_df["name"] == "recording.begin", "timestamp [ns]"
     ]
-    if recording_begin.empty:
-        raise ValueError("events.csv does not contain a recording.begin event")
+    if not _start_video.empty:
+        logging.info(
+            "Aligning on the 'start.video' event (measured sync)"
+        )
+        recording_begin = _start_video
+    elif recording_begin.empty:
+        raise ValueError(
+            "events.csv contains neither a 'start.video' nor a "
+            "'recording.begin' event"
+        )
+    else:
+        logging.warning(
+            "No 'start.video' event found -- falling back to 'recording.begin'. "
+            "This ASSUMES the screen recording and the Neon recording started "
+            "at the same instant. Verify with check_sync.py, or correct with "
+            "--screen_offset_s."
+        )
     start_video_ns = recording_begin.values[0]
+    # --- screen/Neon start-offset correction -------------------------------
+    # By default this code assumes the screen recording and the Neon recording
+    # started at the same instant. --screen_offset_s lets you correct a measured
+    # difference:  offset = (screen start) - (Neon start), in seconds.
+    #   positive -> screen capture began AFTER  the Neon recording
+    #   negative -> screen capture began BEFORE the Neon recording
+    # Applied to start_video_ns so it also covers Screen_Audio below. Device_Mic
+    # is anchored to the Neon's own clock and is deliberately left untouched.
+    # int64 intermediate: start_video_ns is uint64 and a negative offset would
+    # otherwise wrap around.
+    _offset_s = getattr(args, "screen_offset_s", 0.0) or 0.0
+    if _offset_s:
+        start_video_ns = np.uint64(
+            np.int64(start_video_ns) + np.int64(round(_offset_s * 1e9))
+        )
+        _when = "after" if _offset_s > 0 else "before"
+        logging.info(
+            "Applied screen start offset of %+.3f s "
+            "(screen capture began %s the Neon recording)" % (_offset_s, _when)
+        )
+    # -----------------------------------------------------------------------
     # Create some timestamps [ns] for the screen video to match, use the start_video_ns
     # and the ts of the screen video
     sc_timestamps_ns = sc_ts + start_video_ns
@@ -501,6 +543,9 @@ def save_videos(  # noqa: C901 Ignore `Function too complex` flake8 error. TODO:
                 c_scvid[1] : c_scvid[1] + _scframe_final.shape[1],
                 :,
             ] = _scframe_final
+            # Get the final frame (normalize to 8-bit *before* drawing labels:
+            # cv2.putText requires CV_8U, but bkg is float64)
+            out_ = cv2.normalize(bkg, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
             if args.labels:
                 # Add text to the frames
                 y, w, h = 60, 360, 60
@@ -521,16 +566,16 @@ def save_videos(  # noqa: C901 Ignore `Function too complex` flake8 error. TODO:
                     },
                 ]
                 for label in labels:
-                    overlay = bkg[
+                    overlay = out_[
                         y : y + h, (label["margin"] - 10) : (label["margin"] - 10 + w)
                     ]
-                    whiterect = np.ones(overlay.shape) * 255
+                    whiterect = (np.ones(overlay.shape) * 255).astype(np.uint8)
                     res = cv2.addWeighted(overlay, 0.5, whiterect, 0.5, 0)
-                    bkg[
+                    out_[
                         y : y + h, (label["margin"] - 10) : (label["margin"] - 10) + w
                     ] = res
-                    bkg = cv2.putText(
-                        bkg,
+                    out_ = cv2.putText(
+                        out_,
                         label["text"],
                         (label["margin"], 100),
                         cv2.FONT_HERSHEY_SIMPLEX,
@@ -539,9 +584,6 @@ def save_videos(  # noqa: C901 Ignore `Function too complex` flake8 error. TODO:
                         2,
                         2,
                     )
-            # Get the final frame
-            out_ = bkg.copy()
-            out_ = cv2.normalize(out_, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
             if args.visualise:
                 cv2.imshow("Merged Video", out_)
                 if cv2.waitKey(25) & 0xFF == ord("q"):
@@ -609,7 +651,8 @@ def save_videos(  # noqa: C901 Ignore `Function too complex` flake8 error. TODO:
                 out_container.mux(packet)
         if _recording:
             out_container.close()
-        progress_bar.stop_task(merge_audio_task)
+        if merged_audio is not None and _recording:
+            progress_bar.stop_task(merge_audio_task)
         logging.info("Video saved to: " + args.out_video_path)
 
 

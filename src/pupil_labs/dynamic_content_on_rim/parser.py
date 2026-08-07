@@ -56,5 +56,17 @@ def init_parser():
         action="store_true",
         help="Visualise the video as it creates",
     )
+    parser.add_argument(
+        "--screen_offset_s",
+        default=0.0,
+        type=float,
+        help=(
+            "Seconds between the Neon's recording.begin and the true start of "
+            "the screen recording, i.e. (screen start) - (Neon start). "
+            "POSITIVE if screen capture began AFTER the Neon recording; "
+            "NEGATIVE if it began BEFORE. Default 0 assumes they started at the "
+            "same instant. Measure it with check_sync.py."
+        ),
+    )
     parser.set_defaults(visualise=False)
     return parser
