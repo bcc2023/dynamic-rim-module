@@ -68,5 +68,29 @@ def init_parser():
             "same instant. Measure it with check_sync.py."
         ),
     )
+    parser.add_argument(
+        "--screen_start_wallclock",
+        default=None,
+        help=(
+            "Absolute wall-clock time shown by an on-screen millisecond clock "
+            "at the start of the screen recording, e.g. '2026-08-10 "
+            "17:18:46.697'. Interpreted in the COMPUTER'S LOCAL timezone (what "
+            "the on-screen clock displays). Pins the screen recording's first "
+            "frame to real time with millisecond precision, bypassing the "
+            "whole-second creation_time limit. Takes precedence over "
+            "--screen_offset_s."
+        ),
+    )
+    parser.add_argument(
+        "--screen_start_at_video_s",
+        default=0.0,
+        type=float,
+        help=(
+            "Video-relative time in seconds of the frame where you read the "
+            "on-screen clock for --screen_start_wallclock. Default 0.0 = the "
+            "very first frame. Use this if the clock is only legible a moment "
+            "into the recording."
+        ),
+    )
     parser.set_defaults(visualise=False)
     return parser

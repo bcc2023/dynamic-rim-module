@@ -208,18 +208,61 @@ def main():
             "--screen_offset_s."
         )
     start_video_ns = recording_begin.values[0]
+    # --- absolute screen start from an on-screen clock ---------------------
+    # If you recorded a millisecond wall-clock on screen, read the time it
+    # shows at a known video frame and pass it via --screen_start_wallclock.
+    # That pins the screen recording's frame 0 to real time with millisecond
+    # precision -- the video container's own creation_time is only whole-second.
+    # Takes precedence over --screen_offset_s.
+    _wallclock = getattr(args, "screen_start_wallclock", None)
+    _offset_s = getattr(args, "screen_offset_s", 0.0) or 0.0
+    if _wallclock:
+        import datetime as _dt
+
+        _parsed = None
+        for _f in (
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S",
+        ):
+            try:
+                _parsed = _dt.datetime.strptime(_wallclock, _f)
+                break
+            except ValueError:
+                pass
+        if _parsed is None:
+            raise ValueError(
+                "Could not parse --screen_start_wallclock=%r. "
+                "Use 'YYYY-MM-DD HH:MM:SS.fff'." % (_wallclock,)
+            )
+        # A naive datetime's .timestamp() is interpreted in the computer's
+        # LOCAL timezone -- exactly what an on-screen wall clock shows.
+        _at = getattr(args, "screen_start_at_video_s", 0.0) or 0.0
+        _wc_ns = int(round(_parsed.timestamp() * 1e9)) - int(round(_at * 1e9))
+        _implied = (_wc_ns - int(start_video_ns)) / 1e9
+        _dir = "after" if _implied > 0 else "before"
+        logging.info(
+            "On-screen clock: reading %s (local) at video +%.3fs pins screen "
+            "frame 0 to real time. Screen recording began %.3f s %s the Neon "
+            "recording.begin." % (_wallclock, _at, abs(_implied), _dir)
+        )
+        start_video_ns = np.uint64(_wc_ns)
+        if _offset_s:
+            logging.warning(
+                "--screen_offset_s=%+.3f IGNORED: --screen_start_wallclock "
+                "takes precedence." % _offset_s
+            )
     # --- screen/Neon start-offset correction -------------------------------
-    # By default this code assumes the screen recording and the Neon recording
-    # started at the same instant. --screen_offset_s lets you correct a measured
-    # difference:  offset = (screen start) - (Neon start), in seconds.
+    # --screen_offset_s corrects a measured difference when you did NOT use an
+    # on-screen clock:  offset = (screen start) - (Neon start), in seconds.
     #   positive -> screen capture began AFTER  the Neon recording
     #   negative -> screen capture began BEFORE the Neon recording
     # Applied to start_video_ns so it also covers Screen_Audio below. Device_Mic
     # is anchored to the Neon's own clock and is deliberately left untouched.
     # int64 intermediate: start_video_ns is uint64 and a negative offset would
     # otherwise wrap around.
-    _offset_s = getattr(args, "screen_offset_s", 0.0) or 0.0
-    if _offset_s:
+    elif _offset_s:
         start_video_ns = np.uint64(
             np.int64(start_video_ns) + np.int64(round(_offset_s * 1e9))
         )
