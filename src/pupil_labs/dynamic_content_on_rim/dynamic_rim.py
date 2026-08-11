@@ -318,6 +318,34 @@ def main():
     )
     merged = merged[merged["timestamp [ns]"] <= end_video_ns]
 
+    # --- resample onto a real-time grid so the output plays at true speed ---
+    # The screen recording is variable-frame-rate: a frame is written only when
+    # the screen changes. Writing one output frame per source frame at a
+    # constant 30 fps makes playback lurch (slow-motion where frames are dense,
+    # fast-forward where sparse). Instead, sample the merged table on a regular
+    # 1/30 s REAL-TIME grid: each output frame = the source frame nearest that
+    # real instant. Static screen -> the same frame repeats (correctly frozen);
+    # motion -> true 30 fps. Gaze/eye columns ride along by nearest match so
+    # alignment is preserved. Untouched: the CSV (saved from gaze_rim_df) and
+    # the audio path (merged_audio, muxed by its own real timestamps).
+    if len(merged) > 1:
+        _fps = 30
+        _step = int(round(1e9 / _fps))
+        _src = merged.sort_values("timestamp [ns]").reset_index(drop=True)
+        _src["timestamp [ns]"] = _src["timestamp [ns]"].astype(np.int64)
+        _t0 = int(_src["timestamp [ns]"].iloc[0])
+        _t1 = int(_src["timestamp [ns]"].iloc[-1])
+        _grid = np.arange(_t0, _t1 + 1, _step, dtype=np.int64)
+        _grid_df = pd.DataFrame({"timestamp [ns]": _grid})
+        merged = pd.merge_asof(
+            _grid_df, _src, on="timestamp [ns]", direction="nearest"
+        )
+        logging.info(
+            "Real-time render: %d variable-rate source frames -> %d frames at "
+            "%d fps over %.1f s." % (len(_src), len(merged), _fps, (_t1 - _t0) / 1e9)
+        )
+    # -----------------------------------------------------------------------
+
     if audio in audioSources and audio != audioSources.No_Audio:
         logging.info("Creating matched timestamps tables for audio:")
         merged_audio = merge_tables(
