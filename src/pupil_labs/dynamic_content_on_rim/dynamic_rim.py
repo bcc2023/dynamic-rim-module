@@ -364,12 +364,17 @@ def main():
 
     logging.debug(merged.describe().transpose())
 
-    # Plot the videos
-    logging.info("Plotting/Recording...")
-    save_videos(args, merged, ref_img, _screen, merged_audio, audio)
+    # Save the CSV FIRST: its data is ready now, so writing it before the
+    # (potentially very long) video render makes it available immediately and
+    # keeps it even if rendering is interrupted. --no_video skips the render.
     if args.saveCSV:
         logging.info("Saving CSV...")
         gaze_rim_df.to_csv(get_savedir(args.out_csv_path, "csv"), index=True)
+    if getattr(args, "no_video", False):
+        logging.info("Skipping video render (--no_video).")
+    else:
+        logging.info("Plotting/Recording...")
+        save_videos(args, merged, ref_img, _screen, merged_audio, audio)
     logging.info("")
     logging.info("Executed in: %s seconds" % (time.time() - start_time))
     logging.info(
@@ -537,8 +542,13 @@ def save_videos(  # noqa: C901 Ignore `Function too complex` flake8 error. TODO:
     ) as out_container, Progress() as progress_bar:
         out_container.metadata["title"] = "Merged video"
         out_video = out_container.add_stream("libx264", rate=30, options={"crf": "18"})
-        out_video.height = mheight
-        out_video.width = _etframe.width + _scframe.width + refimg_finalwidth
+        # H.264 / yuv420p require EVEN width and height; the composited canvas
+        # can be odd (reference-image aspect ratio), which makes libx264 refuse
+        # to open. Round the stream size down to even; frames are cropped to
+        # match where they are encoded (patch 15).
+        out_video.height = mheight - (mheight % 2)
+        _cw = _etframe.width + _scframe.width + refimg_finalwidth
+        out_video.width = _cw - (_cw % 2)
         out_video.pix_fmt = "yuv420p"
         out_video.codec_context.time_base = Fraction(1, 30)
         if audio in audioSources and merged_audio is not None:
@@ -665,6 +675,9 @@ def save_videos(  # noqa: C901 Ignore `Function too complex` flake8 error. TODO:
                 # Convert to av frame
                 cv2.cvtColor(out_, cv2.COLOR_BGR2RGB, out_)
                 np.expand_dims(out_, axis=2)
+                out_ = np.ascontiguousarray(
+                    out_[: out_video.height, : out_video.width]
+                )
                 out_frame = av.VideoFrame.from_ndarray(out_, format="rgb24")
                 for packet in out_video.encode(out_frame):
                     out_container.mux(packet)

@@ -92,5 +92,14 @@ def init_parser():
             "into the recording."
         ),
     )
-    parser.set_defaults(visualise=False)
+    parser.add_argument(
+        "--no_video",
+        action="store_true",
+        help=(
+            "Skip the merged-video render and only write the CSV. Much faster "
+            "on long recordings when you just need the gaze CSV (e.g. to feed "
+            "cursor_gaze_pipeline.py)."
+        ),
+    )
+    parser.set_defaults(visualise=False, no_video=False)
     return parser
