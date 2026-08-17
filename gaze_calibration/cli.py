@@ -40,7 +40,13 @@ COMMANDS = {
     "analyze":        ("analyze_aligned.py",
                        "distance, per-trial traces, steering-difficulty plots"),
     "calib-transfer": ("apply_calibration_transfer.py",
-                       "transfer calibration offset (calibration -> task), homography"),
+                       "transfer calibration offset (calibration -> task), homography "
+                       "[only valid when calibration & task are the same wearing]"),
+    "selfcal":        ("self_calibrate.py",
+                       "within-session gaze calibration from the task cursor "
+                       "[use when calibration is a different wearing]"),
+    "selfcal-video":  ("selfcal_video.py",
+                       "self-cal in screen-video px (for compose3); needs cursor_scale/bx/by"),
     "compose3":       ("compose_3panel.py",
                        "Neon|Reference|Screen 3-panel video, gaze on all panels"),
     "overlay":        ("screen_gaze_overlay.py",
