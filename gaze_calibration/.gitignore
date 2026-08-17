@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# External mapping fork — installed via pip (editable), not vendored in this repo
+dynamic-rim-module/
+
+# Recordings & generated artifacts — never commit data / outputs
+*.mp4
+*.mov
+*.pdf
+*.csv
+*.png
+*.jpg
+*.jpeg
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

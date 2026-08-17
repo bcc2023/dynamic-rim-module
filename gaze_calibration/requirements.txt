@@ -1,0 +1,10 @@
+numpy
+pandas
+matplotlib
+av
+pillow
+
+# The scene->reference->screen mapping tool is installed separately (editable
+# fork), not from PyPI:
+#   pip install "pupil-labs-dynamic-rim @ git+https://github.com/yurahwang97/dynamic-rim-module.git@a0179667"
+# then apply the local bug patches once:  python patch_all.py --path dynamic-rim-module
