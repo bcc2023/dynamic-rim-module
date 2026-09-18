@@ -134,11 +134,34 @@ def main():
         )
     )
 
-    # Select corners of the screen
+    # Select corners of the screen.
+    # Cache the picked corners in the RIM folder so a batch of recordings that
+    # share ONE reference image only needs a single manual selection: the first
+    # run pops the picker and saves corners_screen.npy; later runs reuse it (no
+    # GUI). An explicit --corners_screen path still overrides. Delete the .npy to
+    # re-pick.
     logging.info("Select corners of the screen...")
-    args.corners_screen, ref_img = pick_point_in_image(
-        args.rim_folder_path, args.corners_screen, 4
-    )
+    _corners_cache = os.path.join(args.rim_folder_path, "corners_screen.npy")
+    if args.corners_screen is not None and isinstance(args.corners_screen, str) \
+            and os.path.exists(args.corners_screen):
+        _corners_cache = args.corners_screen  # explicit file path override
+        args.corners_screen = None
+    if args.corners_screen is None and os.path.exists(_corners_cache):
+        args.corners_screen = np.load(_corners_cache, allow_pickle=True).item()
+        ref_img = cv2.cvtColor(
+            cv2.imread(os.path.join(args.rim_folder_path, "reference_image.jpeg")),
+            cv2.COLOR_BGR2RGB,
+        )
+        logging.info("Reusing cached screen corners from %s", _corners_cache)
+    else:
+        args.corners_screen, ref_img = pick_point_in_image(
+            args.rim_folder_path, args.corners_screen, 4
+        )
+        try:
+            np.save(_corners_cache, args.corners_screen)
+            logging.info("Saved screen corners to %s (reused on later runs)", _corners_cache)
+        except Exception as _e:
+            logging.warning("Could not cache corners: %s", _e)
 
     # Compute the perspective transform
     logging.info("Computing the perspective transform...")

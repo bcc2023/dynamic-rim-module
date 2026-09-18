@@ -41,8 +41,15 @@ def label(img, text):
     dr.text((6, 5), text, fill=(255, 255, 255))
 
 
-def circle(img, x, y, r, w=3):
-    ImageDraw.Draw(img).ellipse([x - r, y - r, x + r, y + r], outline=(255, 0, 0), width=w)
+def circle(img, x, y, r, w=3, col=(255, 0, 0)):
+    ImageDraw.Draw(img).ellipse([x - r, y - r, x + r, y + r], outline=col, width=w)
+
+
+def load_cursor(path):
+    d = pd.read_csv(path).sort_values("neon_timestamp_ns")
+    return {"ts": d["neon_timestamp_ns"].to_numpy(float),
+            "x": d["cursor_screenvid_x_px"].to_numpy(float),
+            "y": d["cursor_screenvid_y_px"].to_numpy(float)}
 
 
 class Streamer:
@@ -112,6 +119,8 @@ def main():
     ap.add_argument("--start_video_ns", required=True)
     ap.add_argument("--gaze_csv", required=True)
     ap.add_argument("--scene_gaze_csv", default=None)
+    ap.add_argument("--cursor_csv", default=None, help="aligned CSV; overlays the (corrected) cursor as a cyan ring on the screen panel")
+    ap.add_argument("--gaze_shift_s", type=float, default=0.0, help="advance the gaze vs the screen by this many seconds (+ = gaze looks ahead); PREVIEW only, does not change the DV")
     ap.add_argument("--out_video", required=True)
     ap.add_argument("--height", type=int, default=720)
     ap.add_argument("--fps", type=int, default=30)
@@ -131,6 +140,7 @@ def main():
         "ty": "gaze position transf y [px]"})
     sg = load_gaze(args.scene_gaze_csv, {"x": "gaze x [px]", "y": "gaze y [px]"}) \
         if args.scene_gaze_csv else None
+    cur = load_cursor(args.cursor_csv) if args.cursor_csv else None
 
     ref = Image.open(args.reference_image).convert("RGB")
     RW, RH = ref.size
@@ -169,13 +179,18 @@ def main():
 
         rimg = ref_base.copy()
         simg = screen.at(w)
-        i = nearest(g["ts"], w, args.tol_ms)
+        i = nearest(g["ts"], w + args.gaze_shift_s * 1e9, args.tol_ms)
         if i is not None:
             if g["rx"] is not None and np.isfinite(g["rx"][i]):
                 circle(rimg, g["rx"][i] * rpw / RW, g["ry"][i] * H / RH, max(6, int(14 * H / RH)))
             if g["tx"] is not None and np.isfinite(g["tx"][i]):
                 circle(simg, g["tx"][i] * screen.pw / screen.W0, g["ty"][i] * H / screen.H0,
                        max(6, int(16 * H / screen.H0)))
+        if cur is not None:
+            j = nearest(cur["ts"], w, args.tol_ms)
+            if j is not None and np.isfinite(cur["x"][j]):
+                circle(simg, cur["x"][j] * screen.pw / screen.W0, cur["y"][j] * H / screen.H0,
+                       max(6, int(14 * H / screen.H0)), col=(0, 210, 255))
         label(simg, "Screen Video")
 
         canvas = Image.new("RGB", (OW, H))

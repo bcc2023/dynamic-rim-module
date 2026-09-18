@@ -117,6 +117,10 @@ def build_aligned(args):
     out["neon_timestamp_ns"] = g["timestamp [ns]"].astype(np.int64)
     out["neon_time_s"] = gaze_neon_s
     out["mac_time_s"] = gaze_neon_s - args.clock_offset_s
+    # advance the gaze vs the cursor by gaze_shift_s (+ = gaze leads). Used ONLY
+    # for cursor matching, so the DV mirrors the video's --gaze_shift_s; the row's
+    # neon_timestamp_ns (and saccade/blink lookup) stays at the gaze's true time.
+    gaze_match_s = gaze_neon_s - args.gaze_shift_s
 
     def col(n):
         return g[n].to_numpy() if n in g.columns else np.full(len(g), np.nan)
@@ -127,6 +131,10 @@ def build_aligned(args):
     out["gaze_transf_y_px"] = col("gaze position transf y [px]")
     out["gaze_transf_x_norm"] = out["gaze_transf_x_px"] / args.screen_width
     out["gaze_transf_y_norm"] = out["gaze_transf_y_px"] / args.screen_height
+    # fixation id carried straight from the (timestamp-sorted) gaze CSV so the
+    # aligned output always has the full 32-column pilot schema, even on a
+    # standalone re-align (no separate merge step needed).
+    out["fixation_id"] = g["fixation id"].to_numpy() if "fixation id" in g.columns else np.nan
 
     for f in ["cursor_traj_x", "cursor_traj_y", "cursor_screen_x", "cursor_screen_y",
               "cursor_speed", "cursor_nearest_mac_ms", "cursor_interp_gap_ms",
@@ -144,11 +152,11 @@ def build_aligned(args):
     for tr in load_cursor_trials(args.experiment_json):
         neon = tr["mac_s"] + args.clock_offset_s   # cursor sample times, on Neon clock
         lo, hi = neon[0], neon[-1]
-        m = (gaze_neon_s >= lo) & (gaze_neon_s <= hi)
+        m = (gaze_match_s >= lo) & (gaze_match_s <= hi)
         if not m.any():
             continue
         idx = np.where(m)[0]
-        gt = gaze_neon_s[idx]
+        gt = gaze_match_s[idx]
         # continuous quantities: linearly interpolated onto each gaze timestamp
         out.loc[idx, "cursor_traj_x"] = np.interp(gt, neon, tr["traj_x"])
         out.loc[idx, "cursor_traj_y"] = np.interp(gt, neon, tr["traj_y"])
@@ -317,13 +325,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gaze_csv", required=True, help="dynamic-rim output CSV")
     ap.add_argument("--experiment_json", required=True)
-    ap.add_argument("--clock_offset_s", type=float, required=True,
+    ap.add_argument("--cursor_map", default=None,
+                    help="JSON from fit-cursor-map with cursor_scale/bx/by, "
+                    "screen_width/height, clock_offset_s. Fills any of the "
+                    "individual options below that you don't pass explicitly.")
+    ap.add_argument("--clock_offset_s", type=float, default=None,
                     help="Neon minus Mac, seconds (per session)")
-    ap.add_argument("--cursor_scale", type=float, required=True)
-    ap.add_argument("--cursor_bx", type=float, required=True)
-    ap.add_argument("--cursor_by", type=float, required=True)
-    ap.add_argument("--screen_width", type=float, default=3840)
-    ap.add_argument("--screen_height", type=float, default=2160)
+    ap.add_argument("--gaze_shift_s", type=float, default=0.0,
+                    help="advance the gaze vs the cursor (+ = gaze leads); mirrors compose's --gaze_shift_s so the DV matches the video")
+    ap.add_argument("--cursor_scale", type=float, default=None)
+    ap.add_argument("--cursor_bx", type=float, default=None)
+    ap.add_argument("--cursor_by", type=float, default=None)
+    ap.add_argument("--screen_width", type=float, default=None)
+    ap.add_argument("--screen_height", type=float, default=None)
     ap.add_argument("--out_csv", required=True)
     # video (optional)
     ap.add_argument("--out_video", default=None)
@@ -335,6 +349,26 @@ def main():
                     help="number of cursor points to draw (1 = just the dot, "
                     "no trail; higher = longer fading tail)")
     args = ap.parse_args()
+
+    # --cursor_map fills any spatial/clock option not passed explicitly.
+    if args.cursor_map:
+        m = json.load(open(args.cursor_map))
+        for k in ("cursor_scale", "cursor_bx", "cursor_by",
+                  "screen_width", "screen_height", "clock_offset_s"):
+            if getattr(args, k) is None and m.get(k) is not None:
+                setattr(args, k, float(m[k]))
+    # defaults / required checks
+    if args.screen_width is None:
+        args.screen_width = 3840
+    if args.screen_height is None:
+        args.screen_height = 2160
+    if args.clock_offset_s is None:
+        args.clock_offset_s = 0.0
+    _need = [n for n in ("cursor_scale", "cursor_bx", "cursor_by")
+             if getattr(args, n) is None]
+    if _need:
+        sys.exit("ERROR: need " + ", ".join("--" + n for n in _need)
+                 + " (or pass --cursor_map)")
 
     build_aligned(args)
 

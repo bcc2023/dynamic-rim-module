@@ -35,8 +35,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # command -> (script filename, one-line help)
 COMMANDS = {
+    "fit-cursor-map": ("fit_cursor_map.py",
+                       "derive cursor_scale/bx/by (+clock offset) from the screen "
+                       "video by detecting the orange target -> *_cursor_map.json"),
     "align":          ("cursor_gaze_pipeline.py",
-                       "cursor(JSON) + gaze -> aligned CSV (after pl-dynamic-rim)"),
+                       "cursor(JSON) + gaze -> aligned CSV (after pl-dynamic-rim); "
+                       "accepts --cursor_map from fit-cursor-map"),
     "analyze":        ("analyze_aligned.py",
                        "distance, per-trial traces, steering-difficulty plots"),
     "calib-transfer": ("apply_calibration_transfer.py",

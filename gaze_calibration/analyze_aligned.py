@@ -15,9 +15,14 @@ STEP 1 — Euclidean distance between cursor and gaze, at each in-trial timestam
 """
 import argparse
 import json
+import os
+import sys
 
 import numpy as np
 import pandas as pd
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tunnel_centerline import centerline_for_condition, project_arclen  # noqa: E402
 
 
 # --- path length A (arc-length corrected), from the attached length.py --------
@@ -104,6 +109,92 @@ def _presentations_in_order(df, experiment_json):
     return out
 
 
+# --- 4-block per-trial segmentation (start dot / constrained / unconstrained /
+#     target dot), from the experiment canvas design -----------------------------
+_TPY = {"top": 0.05, "middle": 0.13, "bottom": 0.21}
+_BLOCK_COL = {"start": "#1f77b4", "target": "#ff7f0e",
+              "constrained": "#2ca02c", "unconstrained": "#d62728"}
+
+
+def _cond_lookup(experiment_json):
+    if not experiment_json:
+        return {}
+    d = json.load(open(experiment_json))
+    return {(tr.get("trial_id"), tr.get("round")): (tr.get("condition") or {})
+            for tr in d.get("trialData", [])}
+
+
+def _dot_target_radius(c):
+    """Target-dot radius from the trial condition (computeTargetRadius port)."""
+    tt = (c or {}).get("tunnelType")
+    if tt in ("wide_to_narrow", "narrow_to_wide"):
+        return 0.5 * c.get("segment2Width", 0.02)
+    if tt == "straight":
+        return c.get("radiusRatio", 0.5) * c.get("tunnelWidth", 0.02)
+    if tt in ("unconstrained_pointing", "constrained_to_unconstrained"):
+        return c.get("targetRadius", 0.01)
+    return 0.5 * (c or {}).get("tunnelWidth", 0.02)
+
+
+def _dot_block_spans(g, cond):
+    """Classify a trial's in-order samples into 4 contiguous blocks: on the START
+    dot (r=0.008), constrained / unconstrained while traversing, on the TARGET dot
+    (computeTargetRadius). Start/target centred on the design positions. Returns
+    (spans list of (i0,i1,key), target_radius)."""
+    cur = g[["cursor_traj_x", "cursor_traj_y"]].to_numpy(float)
+    n = len(cur)
+    con = (g["constrained"].astype(str).to_numpy() if "constrained" in g.columns
+           else np.array(["constrained"] * n))
+    start = cur[0]
+    tt = (cond or {}).get("tunnelType")
+    if tt in ("unconstrained_pointing", "constrained_to_unconstrained"):
+        tgt = np.array([cond.get("distance", cur[-1, 0]),
+                        _TPY.get(cond.get("targetPosition"), cur[-1, 1])])
+    else:
+        tgt = cur[-1]
+    Rt = _dot_target_radius(cond or {})
+    on_s = np.hypot(*(cur - start).T) <= 0.008
+    on_t = np.hypot(*(cur - tgt).T) <= Rt
+    k = 0
+    while k < n and on_s[k]:
+        k += 1
+    m = n
+    while m > 0 and on_t[m - 1]:
+        m -= 1
+    spans = []
+    if k > 0:
+        spans.append((0, k - 1, "start"))
+    j = k
+    while j < m:
+        b = j
+        while j < m and con[j] == con[b]:
+            j += 1
+        spans.append((b, j - 1, con[b]))
+    if m < n:
+        spans.append((m, n - 1, "target"))
+    return spans, Rt
+
+
+def _draw_dot_blocks(ax, t, spans, Rt):
+    """Draw the 4 shaded blocks + on-block constrained/unconstrained labels;
+    return legend handles (start / constrained / unconstrained / target)."""
+    from matplotlib.patches import Patch
+    n = len(t); bl = ax.get_xaxis_transform()
+    for i0, i1, key in spans:
+        if i1 < i0:
+            continue
+        x0 = t[i0] - (t[i0] - t[i0 - 1]) / 2 if i0 > 0 else t[0]
+        x1 = t[i1] + (t[i1 + 1] - t[i1]) / 2 if i1 < n - 1 else t[-1]
+        ax.axvspan(x0, x1, color=_BLOCK_COL.get(key, "#888"), alpha=0.20, lw=0)
+        if key in ("constrained", "unconstrained"):
+            ax.text((x0 + x1) / 2, 0.95, key, transform=bl, ha="center", va="top",
+                    color=_BLOCK_COL[key], fontsize=9, fontweight="bold")
+    # constrained/unconstrained are labelled on their blocks; the legend only
+    # needs the two dot colours (their blocks are too narrow to label on-plot).
+    return [Patch(facecolor=_BLOCK_COL[k2], alpha=0.35, label=lab) for k2, lab in
+            [("start", "on start dot (r=0.008)"), ("target", f"on target dot (r={Rt:g})")]]
+
+
 def step2_plot_per_trial(df, out_pdf, experiment_json=None):
     """One page per trial PRESENTATION (in chronological order): gaze-cursor
     distance vs time. Shade/label the constrained vs unconstrained segments; if
@@ -116,6 +207,7 @@ def step2_plot_per_trial(df, out_pdf, experiment_json=None):
     has_con = "constrained" in df.columns
     df = df.sort_values("neon_time_s").reset_index(drop=True)
     presentations = _presentations_in_order(df, experiment_json)
+    condmap = _cond_lookup(experiment_json)
     n = 0
     with PdfPages(out_pdf) as pdf:
         for idx, ordn, n_trials, tid, rnd, desc, mask in presentations:
@@ -137,29 +229,9 @@ def step2_plot_per_trial(df, out_pdf, experiment_json=None):
             ax.set_title(f"Trial {ord_s}{rnd_s}   —   {desc}   (id {tid_s})", fontsize=9)
             ax.margins(x=0)
 
-            colors = {"constrained": "#2ca02c", "unconstrained": "#d62728"}
-            if has_con:
-                con = g["constrained"].astype(str).to_numpy()
-                # contiguous segments of equal condition
-                changes = np.where(con[:-1] != con[1:])[0]
-                bounds = [0] + [c + 1 for c in changes] + [len(con)]
-                # segment edges meet exactly at the transition midpoints, so the
-                # colored regions are contiguous (no unshaded gap / "blank")
-                trans = [(t[ci] + t[ci + 1]) / 2 for ci in changes]
-                edges = [t[0]] + trans + [t[-1]]
-                blend = ax.get_xaxis_transform()          # x in data, y in axes fraction
-                for bi in range(len(bounds) - 1):
-                    lo = bounds[bi]
-                    lab = con[lo]
-                    col = colors.get(lab, "#7f7f7f")
-                    x0, x1 = edges[bi], edges[bi + 1]
-                    ax.axvspan(x0, x1, color=col, alpha=0.08)
-                    ax.text((x0 + x1) / 2, 0.96, lab, transform=blend,
-                            ha="center", va="top",
-                            color=col, fontsize=9, fontweight="bold")
-                # vertical divider(s) at each transition
-                for xt in trans:
-                    ax.axvline(xt, color="black", ls="--", lw=1.2)
+            spans, Rt = _dot_block_spans(g, condmap.get((tid, rnd), {}))
+            handles = _draw_dot_blocks(ax, t, spans, Rt)
+            ax.legend(handles=handles, fontsize=7.5, loc="upper right", framealpha=0.95)
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
             n += 1
@@ -392,24 +464,50 @@ def _constrained_centerline(tr):
     return P[idx[0]:idx[-1]+1], W[idx[0]:idx[-1]+1], K[idx[0]:idx[-1]+1]
 
 
-def _tunnel_ID(tr, rdp_eps=0.005, curv_thresh=0.5):
-    """ID_W = ∫ds/W and ID_K = ∫|κ|ds for the constrained segment.
-    ID_K = max(curvature-field integral, turning of the RDP-simplified path):
-    the field is right for smooth sinusoids, RDP geometry for sharp corners
-    (whose curvature field is 0), and both ~0 for straight/width tunnels.
-    family = 'curvature' if ID_K exceeds curv_thresh else 'width'."""
-    cl = _constrained_centerline(tr)
-    if cl is None:
+def _exact_centerline(tr, clip_constrained=False):
+    """EXACT analytic tunnel centerline (task coords) for this trial, regenerated
+    from its `condition` via the experiment's own path generators
+    (tunnel_centerline.centerline_for_condition) — NOT the recorded cursor path.
+    Returns (P[n,2], meta) or None. If clip_constrained, keep only the corridor
+    (constrained) portion of a constrained_to_unconstrained trial."""
+    c = tr.get("condition") or {}
+    traj = tr.get("trajectory") or []
+    tgt = (traj[-1]["x"], traj[-1]["y"]) if traj else None
+    P, meta = centerline_for_condition(c, target_pos=tgt)
+    if clip_constrained and c.get("tunnelType") == "constrained_to_unconstrained":
+        P = P[P[:, 0] <= 0.23]
+    if len(P) < 3:
         return None
-    P, W, K = cl
+    return P, meta
+
+
+def _tunnel_ID(tr, curv_thresh=0.5):
+    """ID_W = ∫ds/W and ID_K = ∫|κ|ds for the constrained segment, measured on the
+    EXACT analytic centerline:
+      ID_W = Σ ds / W(s)  (W from the condition's width model; piecewise for
+             narrow↔wide),
+      ID_K = total absolute turning angle of the exact centerline (= ∫|κ|ds),
+             which is exact for smooth sinusoids AND sharp corners alike.
+    family comes from the tunnel type (sinusoids/corners -> curvature; straight,
+    narrow↔wide -> width)."""
+    ec = _exact_centerline(tr, clip_constrained=True)
+    if ec is None:
+        return None
+    P, meta = ec
+    Wfn = meta.get("width_fn")
+    if Wfn is None:
+        return None
     ds = np.linalg.norm(np.diff(P, axis=0), axis=1)
-    Wmid = 0.5 * (W[:-1] + W[1:])
+    s = np.concatenate([[0.0], np.cumsum(ds)])
+    smid = 0.5 * (s[:-1] + s[1:])
+    W = np.asarray(Wfn(smid), float)
     with np.errstate(divide="ignore", invalid="ignore"):
-        IDW = float(np.nansum(ds / Wmid))
-    IDK_field = float(np.nansum(0.5 * (np.abs(K[:-1]) + np.abs(K[1:])) * ds))
-    IDK = max(IDK_field, _turning(_rdp(P, rdp_eps)))
-    return {"ID_W": IDW, "ID_K": IDK,
-            "family": "curvature" if IDK > curv_thresh else "width"}
+        IDW = float(np.nansum(ds / np.where(W > 0, W, np.nan)))
+    IDK = _turning(P)
+    family = meta.get("family")
+    if family not in ("width", "curvature"):
+        family = "curvature" if IDK > curv_thresh else "width"
+    return {"ID_W": IDW, "ID_K": IDK, "family": family}
 
 
 def _fit_px_to_task(df):
@@ -526,57 +624,349 @@ def step_plot_gazelead(tbl, family, out_png):
     print(f"wrote {out_png}: {len(xs)} {family}-family presentations")
 
 
+# ============================================================================
+# Extended outputs: distance AND gaze lead vs difficulty, per-trial time series,
+# organized into 3 subfolders (Distance-based / Gaze-lead-based / Per-trial ...).
+# ============================================================================
+def _straight_s(a, b, pts):
+    """Signed arc length of pts projected onto the line a->b (a = 0)."""
+    d = b - a
+    L = float(np.hypot(*d))
+    if L < 1e-9:
+        return np.zeros(len(pts))
+    return (np.asarray(pts, float) - a) @ (d / L)
+
+
+def _smooth_centerline(P, M=140, win=13):
+    """Tunnel-centerline proxy: recorded path resampled uniformly in x and
+    smoothed. The tunnels are narrow so the cursor hugs the centre, so this
+    approximates the tunnel centerline (not the raw, jittery cursor path).
+    Returns (xs, s) — x grid and cumulative arc length on the smoothed line."""
+    x, y = P[:, 0], P[:, 1]
+    o = np.argsort(x); x, y = x[o], y[o]
+    xu, iu = np.unique(x, return_index=True); yu = y[iu]
+    if len(xu) < 4:
+        s = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(xu), np.diff(yu)))])
+        return xu, s
+    xs = np.linspace(xu[0], xu[-1], M)
+    ys = np.interp(xs, xu, yu)
+    if 3 <= win < M:
+        k = np.ones(win) / win
+        ys = np.convolve(np.pad(ys, win // 2, mode="edge"), k, "valid")[:M]
+    s = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(xs), np.diff(ys)))])
+    return xs, s
+
+
+def add_gaze_lead_column(df, experiment_json):
+    """Add df['gaze_lead_signed'] (TASK UNITS, + = gaze ahead) per in-trial
+    sample: project cursor and gaze onto that trial's centerline and take
+    s_gaze - s_cursor. Constrained trials project onto the EXACT analytic tunnel
+    centerline (regenerated from the condition); pointing uses the straight
+    start→target line.
+
+    Gaze lead is an arc length along the tunnel centerline, and the centerline is
+    defined in the experiment's task coordinate space (where the tunnel geometry
+    is authored), so it comes out in task units."""
+    d = json.load(open(experiment_json))
+    px_to_task, rms = _fit_px_to_task(df)
+    gtask = px_to_task(df[["gaze_transf_x_px", "gaze_transf_y_px"]].to_numpy())
+    ctask = df[["cursor_traj_x", "cursor_traj_y"]].to_numpy(float)
+    mac = df["mac_time_s"].to_numpy(float)
+    intr = df["in_trial"].to_numpy(bool)
+    lead = np.full(len(df), np.nan)
+    for tr in d.get("trialData", []):
+        ts = tr.get("timestamps") or []
+        traj = tr.get("trajectory") or []
+        if len(ts) < 2 or len(traj) < 2:
+            continue
+        lo, hi = ts[0] / 1000.0, ts[-1] / 1000.0
+        idx = np.where(intr & (mac >= lo) & (mac <= hi))[0]
+        if len(idx) < 1:
+            continue
+        if (tr.get("condition") or {}).get("tunnelType") == "unconstrained_pointing":
+            P = np.array([[p["x"], p["y"]] for p in traj], float)
+            sc = _straight_s(P[0], P[-1], ctask[idx])
+            sg = _straight_s(P[0], P[-1], gtask[idx])
+        else:
+            ec = _exact_centerline(tr)         # exact analytic tunnel centerline
+            if ec is None:
+                continue
+            P = ec[0]
+            sc = project_arclen(P, ctask[idx])
+            sg = project_arclen(P, gtask[idx])
+        lead[idx] = sg - sc
+    df["gaze_lead_signed"] = lead   # task units (arc length in the task coord space)
+    return df, rms
+
+
+def agg_table(df, experiment_json, segment):
+    """Per presentation of `segment`: mean_dist (px), gaze_lead (task units), and
+    difficulty — constrained: ID_W/ID_K/family/AW; unconstrained: fitts."""
+    d = json.load(open(experiment_json))
+    mac = df["mac_time_s"].to_numpy(float)
+    intr = df["in_trial"].to_numpy(bool)
+    con = (df["constrained"].astype(str).to_numpy()
+           if "constrained" in df.columns else None)
+    dist = df["gaze_cursor_dist_px"].to_numpy(float)
+    lead = (df["gaze_lead_signed"].to_numpy(float)
+            if "gaze_lead_signed" in df.columns else np.full(len(df), np.nan))
+    rows = []
+    for tr in d.get("trialData", []):
+        ts = tr.get("timestamps") or []
+        if len(ts) < 2:
+            continue
+        lo, hi = ts[0] / 1000.0, ts[-1] / 1000.0
+        mask = intr & (mac >= lo) & (mac <= hi)
+        if con is not None:
+            mask = mask & (con == segment)
+        if mask.sum() < 3:
+            continue
+        row = {"trial_id": tr.get("trial_id"), "round": tr.get("round"),
+               "tunnelType": (tr.get("condition") or {}).get("tunnelType"),
+               "mean_dist": float(np.nanmean(dist[mask])),
+               "gaze_lead": float(np.nanmean(lead[mask]))}
+        if segment == "constrained":
+            idw = _tunnel_ID(tr)
+            if idw is None:
+                continue
+            aw = _constrained_AW(tr)
+            row.update(family=idw["family"], ID_W=idw["ID_W"], ID_K=idw["ID_K"],
+                       AW=(aw["difficulty"] if aw else np.nan))
+        else:
+            u = _unconstrained_ID(tr)
+            if u is None:
+                continue
+            row["fitts"] = u["difficulty"]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _scatter(sub, xcol, ycol, xlabel, ylabel, title, out_png, color,
+             zeroline=False, seg=None, footnote=None):
+    import matplotlib.pyplot as plt
+    if xcol not in sub or ycol not in sub:
+        print(f"  (skip {os.path.basename(out_png)}: no data)")
+        return
+    xs = sub[xcol].to_numpy(float)
+    ys = sub[ycol].to_numpy(float)
+    ok = np.isfinite(xs) & np.isfinite(ys)
+    xs, ys = xs[ok], ys[ok]
+    fig, ax = plt.subplots(figsize=(7, 5.4) if footnote else (7, 5))
+    ax.scatter(xs, ys, s=28, color=color, alpha=0.75, edgecolor="k", linewidth=0.3)
+    if zeroline:
+        ax.axhline(0, color="gray", lw=0.8)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    # segment (constrained / unconstrained) written into the title, colour-coded
+    if seg:
+        segcol = {"constrained": "#2ca02c", "unconstrained": "#d62728"}.get(seg, "0.2")
+        ax.set_title(f"[{seg.upper()}]  {title}", fontsize=10, color=segcol)
+    else:
+        ax.set_title(title, fontsize=10)
+    if footnote:
+        fig.text(0.5, 0.015, footnote, ha="center", va="bottom", fontsize=7,
+                 style="italic", color="0.35")
+        fig.tight_layout(rect=[0, 0.13, 1, 1])
+    else:
+        fig.tight_layout()
+    fig.savefig(out_png, dpi=120)
+    plt.close(fig)
+    print(f"  wrote {os.path.basename(out_png)} ({len(xs)} pts)")
+
+
+def step_plot_lead_time(df, out_pdf, experiment_json):
+    """Per-trial presentation: signed gaze lead vs time (task units), with the
+    constrained (green) vs unconstrained (red) segments shaded/labelled and a
+    divider at the transition — same scheme as the per-trial distance plot."""
+    from matplotlib.backends.backend_pdf import PdfPages
+    import matplotlib.pyplot as plt
+    if "gaze_lead_signed" not in df.columns:
+        return
+    has_con = "constrained" in df.columns
+    condmap = _cond_lookup(experiment_json)
+    df = df.sort_values("neon_time_s").reset_index(drop=True)
+    n = 0
+    with PdfPages(out_pdf) as pdf:
+        for idx, ordn, n_trials, tid, rnd, desc, mask in _presentations_in_order(df, experiment_json):
+            g = df[mask].sort_values("neon_time_s")
+            if len(g) < 2:
+                continue
+            t = g["neon_time_s"].to_numpy(float)
+            t = t - t[0]
+            y = g["gaze_lead_signed"].to_numpy(float)
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(t, y, ".", color="#9467bd", ms=3)
+            ax.axhline(0, color="gray", lw=0.8)
+            ax.set_xlabel("time since trial start (s)")
+            ax.set_ylabel("signed gaze lead along centerline (task units)\n(+ gaze ahead  /  − cursor ahead)")
+            ord_s = f"{int(ordn)}/{n_trials}" if (ordn is not None and ordn == ordn) else "?"
+            rnd_s = f"  round {int(rnd)}" if (rnd is not None and rnd == rnd) else ""
+            tid_s = int(tid) if tid == tid else "?"
+            ax.set_title(f"Trial {ord_s}{rnd_s}   —   {desc}   (id {tid_s})", fontsize=9)
+            ax.margins(x=0)
+            spans, Rt = _dot_block_spans(g, condmap.get((tid, rnd), {}))
+            handles = _draw_dot_blocks(ax, t, spans, Rt)
+            ax.legend(handles=handles, fontsize=7.5, loc="upper right", framealpha=0.95)
+            ax.text(0.5, -0.14,
+                    "Gaze lead = arc length along the tunnel centerline (the experiment's task coordinate space), so it is in task units.",
+                    transform=ax.transAxes, ha="center", va="top", fontsize=7,
+                    style="italic", color="0.4")
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+            n += 1
+    print(f"  wrote {os.path.basename(out_pdf)} ({n} pages)")
+
+
+def step_speed_distance(df, out_dir, base, experiment_json):
+    """Cursor speed vs the Euclidean gaze-cursor distance, split into
+    constrained | unconstrained panels.  Writes one figure:
+        <base>_speed_vs_euclidean.png
+      x = Euclidean gaze-cursor distance (screen-video px)
+      y = cursor speed (task units/s), the experiment's per-sample speed
+      black line = median cursor speed per distance bin."""
+    import matplotlib.pyplot as plt
+    need = {"gaze_cursor_dist_px", "cursor_traj_x", "cursor_traj_y",
+            "mac_time_s", "neon_time_s", "in_trial"}
+    if not need.issubset(df.columns):
+        print("  (skip speed/euclidean: missing columns)")
+        return
+    # remove any superseded variants from earlier layouts
+    for _s in ("_speed_distance.png", "_gazelead_vs_speed.png", "_gazelead_vs_distance.png",
+               "_euclidean_vs_speed.png", "_euclidean_vs_distance.png"):
+        _p = os.path.join(out_dir, base + _s)
+        if os.path.exists(_p):
+            try:
+                os.remove(_p)
+            except Exception:
+                pass
+    has_con = "constrained" in df.columns
+    SP, EU, SEG = [], [], []
+    for idx, ordn, n_trials, tid, rnd, desc, mask in _presentations_in_order(df, experiment_json):
+        g = df[mask].sort_values("neon_time_s")
+        t = g["mac_time_s"].to_numpy(float)
+        px = g["cursor_traj_x"].to_numpy(float); py = g["cursor_traj_y"].to_numpy(float)
+        eu = g["gaze_cursor_dist_px"].to_numpy(float)
+        con = (g["constrained"].astype(str).to_numpy() if has_con else np.array(["?"] * len(g)))
+        ok = np.isfinite(t) & np.isfinite(px) & np.isfinite(py)
+        t, px, py, eu, con = t[ok], px[ok], py[ok], eu[ok], con[ok]
+        o = np.argsort(t); t, px, py, eu, con = t[o], px[o], py[o], eu[o], con[o]
+        keep = np.concatenate([[True], np.diff(t) > 1e-4])
+        t, px, py, eu, con = t[keep], px[keep], py[keep], eu[keep], con[keep]
+        if len(t) < 5:
+            continue
+        speed = np.hypot(np.gradient(px, t), np.gradient(py, t))         # task units / s
+        SP.append(speed); EU.append(eu); SEG.append(con)
+    if not SP:
+        print("  (skip speed/euclidean: no data)")
+        return
+    SP = np.concatenate(SP); EU = np.concatenate(EU); SEG = np.concatenate(SEG)
+    cmap = {"constrained": "#2ca02c", "unconstrained": "#d62728"}
+    xmax = np.nanpercentile(EU, 99); ymax = np.nanpercentile(SP, 99.5)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.6), sharex=True, sharey=True)
+    for a, s in zip(axes, ["constrained", "unconstrained"]):
+        col = cmap[s]; m = (SEG == s) & np.isfinite(EU) & np.isfinite(SP)
+        x, y = EU[m], SP[m]
+        a.scatter(x, y, s=6, color=col, alpha=0.28, linewidths=0, label="samples")
+        if len(x) > 50:
+            bins = np.linspace(0, xmax, 16); bidx = np.digitize(x, bins); bx, by = [], []
+            for b in range(1, len(bins)):
+                v = y[bidx == b]
+                if len(v) >= 10:
+                    bx.append((bins[b - 1] + bins[b]) / 2); by.append(np.median(v))
+            a.plot(bx, by, "o-", color="black", ms=4, lw=1.6, label="median speed per distance bin")
+        a.set_title(f"[{s.upper()}]   n={int(m.sum())} samples", fontsize=10, color=col)
+        a.set_xlabel("Euclidean gaze-cursor distance (px)")
+        a.set_ylabel("cursor speed (task units/s)")
+        a.set_xlim(0, xmax); a.set_ylim(0, ymax * 1.05); a.legend(fontsize=8, loc="upper right")
+    fig.suptitle("Cursor speed vs Euclidean gaze-cursor distance   (constrained | unconstrained)", fontsize=12)
+    fig.text(0.5, 0.02,
+             "x = Euclidean gaze-cursor distance = sqrt((gaze_x-cursor_x)^2 + (gaze_y-cursor_y)^2), screen-video px.   "
+             "y = cursor speed = experiment's per-sample sqrt((dx/dt)^2 + (dy/dt)^2), task units/s.",
+             ha="center", fontsize=8, color="0.35")
+    fig.tight_layout(rect=[0, 0.05, 1, 0.95])
+    fig.savefig(os.path.join(out_dir, base + "_speed_vs_euclidean.png"), dpi=120)
+    plt.close(fig)
+    print(f"  wrote {base}_speed_vs_euclidean.png ({len(SP)} samples)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--aligned_csv", required=True)
-    ap.add_argument("--experiment_json", default=None,
-                    help="steering JSON, needed for path length / difficulty (steps 3-4)")
-    ap.add_argument("--out_csv", default=None,
-                    help="where to write the augmented CSV (default: <input>_analysis.csv)")
-    ap.add_argument("--out_pdf", default=None,
-                    help="per-trial distance plots (default: <input>_trials.pdf)")
+    ap.add_argument("--experiment_json", required=True)
+    ap.add_argument("--out_dir", default=None,
+                    help="output root (default: folder of the aligned CSV)")
     args = ap.parse_args()
 
     df = pd.read_csv(args.aligned_csv)
-
-    # --- STEP 1 -------------------------------------------------------------
     df = step1_gaze_cursor_distance(df)
-    d = df["gaze_cursor_dist_px"].dropna()
-    print("STEP 1 — gaze-cursor Euclidean distance (in-trial, px):")
-    print(f"  n in-trial samples: {len(d)}")
-    print(f"  mean {d.mean():.1f}, median {d.median():.1f}, "
-          f"std {d.std():.1f}, min {d.min():.1f}, max {d.max():.1f}")
+    df, rms = add_gaze_lead_column(df, args.experiment_json)
+    print(f"gaze→task affine fit: {rms:.1f}px RMS")
 
-    out = args.out_csv or args.aligned_csv.rsplit(".", 1)[0] + "_analysis.csv"
-    df.to_csv(out, index=False)
-    print(f"wrote {out}")
+    root = args.out_dir or os.path.dirname(os.path.abspath(args.aligned_csv))
+    base = os.path.splitext(os.path.basename(args.aligned_csv))[0]
+    dist_dir = os.path.join(root, "Distance-based")
+    lead_dir = os.path.join(root, "Gaze-lead-based")
+    trial_dir = os.path.join(root, "Per-trial time series")
+    speed_dir = os.path.join(root, "Speed-and-distance")
+    for dd in (dist_dir, lead_dir, trial_dir, speed_dir):
+        os.makedirs(dd, exist_ok=True)
+    df.to_csv(os.path.join(root, base + "_analysis.csv"), index=False)
 
-    # --- STEP 2 -------------------------------------------------------------
-    out_pdf = args.out_pdf or args.aligned_csv.rsplit(".", 1)[0] + "_trials.pdf"
-    step2_plot_per_trial(df, out_pdf, experiment_json=args.experiment_json)
+    C = agg_table(df, args.experiment_json, "constrained")
+    U = agg_table(df, args.experiment_json, "unconstrained")
+    Cw = C[C.get("family") == "width"] if len(C) else C
+    Ck = C[C.get("family") == "curvature"] if len(C) else C
+    C.to_csv(os.path.join(root, base + "_constrained_table.csv"), index=False)
+    U.to_csv(os.path.join(root, base + "_unconstrained_table.csv"), index=False)
 
-    # --- STEP 3 : difficulty aggregate plots --------------------------------
-    if args.experiment_json:
-        base = args.aligned_csv.rsplit(".", 1)[0]
+    FIT = r"Fitts ID $=\log_2(1+D/W)$"
+    IDW = r"$\mathrm{ID_W}=\int ds/W$"
+    IDK = r"$\mathrm{ID_K}=\int|\kappa|\,ds$"
+    DIST = "mean gaze-cursor distance (px)"
+    LEAD = "mean gaze lead along centerline (task units, + = gaze ahead)"
 
-        # Unconstrained (pointing) — Fitts ID, unchanged
-        diff_df = step3_difficulty_table(args.experiment_json)
-        diff_df.to_csv(base + "_difficulty.csv", index=False)
-        step_plot_difficulty(df, args.experiment_json, "unconstrained",
-                             base + "_unconstrained_difficulty.png")
+    print("Distance-based/:")
+    _scatter(U, "fitts", "mean_dist", FIT, DIST, "distance vs Fitts ID",
+             os.path.join(dist_dir, base + "_unconstrained_dist_vs_Fitts.png"), "#d62728",
+             seg="unconstrained")
+    _scatter(C, "AW", "mean_dist", "steering difficulty  A/W (old)", DIST,
+             "distance vs A/W (old index)",
+             os.path.join(dist_dir, base + "_constrained_dist_vs_AW.png"), "#2ca02c",
+             seg="constrained")
+    _scatter(Cw, "ID_W", "mean_dist", IDW, DIST, "width family: distance vs ID_W",
+             os.path.join(dist_dir, base + "_width_dist_vs_IDW.png"), "#2ca02c",
+             seg="constrained")
+    _scatter(Ck, "ID_K", "mean_dist", IDK, DIST, "curvature family: distance vs ID_K",
+             os.path.join(dist_dir, base + "_curvature_dist_vs_IDK.png"), "#9467bd",
+             seg="constrained")
 
-        # Constrained (steering) — NEW: gaze lead vs ID_W (width) / ID_K (curvature)
-        print("STEP 3 — constrained gaze lead vs new difficulty index:")
-        tbl = constrained_gazelead_table(df, args.experiment_json)
-        tbl.to_csv(base + "_gazelead_ID.csv", index=False)
-        nw = (tbl["family"] == "width").sum()
-        nk = (tbl["family"] == "curvature").sum()
-        print(f"  {len(tbl)} constrained presentations "
-              f"({nw} width family, {nk} curvature family) → {base}_gazelead_ID.csv")
-        step_plot_gazelead(tbl, "width", base + "_width_gazelead_IDW.png")
-        step_plot_gazelead(tbl, "curvature", base + "_curvature_gazelead_IDK.png")
-    else:
-        print("(skipping step 3: pass --experiment_json to compute difficulty)")
+    LEAD_NOTE = (
+        "Gaze lead: at each in-trial sample, project the cursor and the gaze onto the trial's centerline\n"
+        "(exact analytic tunnel path; straight start→target for unconstrained) → arc-length positions s(cursor), s(gaze).\n"
+        "Per-sample lead h = s(gaze) − s(cursor);  each point = one trial's MEAN h across its samples  (+ = gaze ahead).\n"
+        "Gaze lead is an arc length along the tunnel centerline, defined in the experiment's task coordinate space\n"
+        "(where the tunnel geometry is authored), so it comes out in task units."
+    )
+    print("Gaze-lead-based/:")
+    _scatter(U, "fitts", "gaze_lead", FIT, LEAD, "gaze lead vs Fitts ID",
+             os.path.join(lead_dir, base + "_unconstrained_lead_vs_Fitts.png"), "#d62728",
+             zeroline=True, seg="unconstrained", footnote=LEAD_NOTE)
+    _scatter(Cw, "ID_W", "gaze_lead", IDW, LEAD, "width family: gaze lead vs ID_W",
+             os.path.join(lead_dir, base + "_width_lead_vs_IDW.png"), "#2ca02c",
+             zeroline=True, seg="constrained", footnote=LEAD_NOTE)
+    _scatter(Ck, "ID_K", "gaze_lead", IDK, LEAD, "curvature family: gaze lead vs ID_K",
+             os.path.join(lead_dir, base + "_curvature_lead_vs_IDK.png"), "#9467bd",
+             zeroline=True, seg="constrained", footnote=LEAD_NOTE)
+
+    print("Per-trial time series/:")
+    step2_plot_per_trial(df, os.path.join(trial_dir, base + "_signed_distance_vs_time.pdf"),
+                         experiment_json=args.experiment_json)
+    step_plot_lead_time(df, os.path.join(trial_dir, base + "_signed_gazelead_vs_time.pdf"),
+                        args.experiment_json)
+
+    print("Speed-and-distance/:")
+    step_speed_distance(df, speed_dir, base, args.experiment_json)
 
 
 if __name__ == "__main__":
